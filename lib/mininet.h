@@ -5,10 +5,12 @@
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
     #endif
-    #include <windows.h>
     #include <winsock2.h>
     #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
+    #include <windows.h>
+    #ifdef _MSC_VER
+        #pragma comment(lib, "ws2_32.lib")
+    #endif
     typedef SOCKET net_sock_t;
     #define NET_INVALID_SOCKET INVALID_SOCKET
     #define net_error() WSAGetLastError()
@@ -29,6 +31,20 @@
 #include <stdint.h>
 #include <string.h>
 #include <limits.h>
+
+/* Portable 64-bit big-endian <-> host byte order */
+#if defined(_WIN32)
+#  include <stdlib.h>
+#  define be64toh(x) _byteswap_uint64(x)
+#  define htobe64(x) _byteswap_uint64(x)
+#elif defined(__APPLE__)
+#  include <machine/endian.h>
+#  include <libkern/OSByteOrder.h>
+#  define be64toh(x) OSSwapBigToHostInt64(x)
+#  define htobe64(x) OSSwapHostToBigInt64(x)
+#else
+#  include <endian.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,3 +1,5 @@
+#include "isr.h"    /* must be first: pulls in winsock2.h before windows.h on Windows */
+#include "lz4.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -6,7 +8,8 @@
 #ifdef _WIN32
   #include <io.h>
   #include <direct.h>
-  #include <windows.h>
+  #include <sys/stat.h>
+  #include <fcntl.h>
 #else
   #include <unistd.h>
   #include <sys/stat.h>
@@ -14,9 +17,6 @@
   #include <fcntl.h>
   #include <libgen.h>
 #endif
-
-#include "isr.h"
-#include "lz4.h"
 
 // Forward declarations for internal command handlers
 static int isr_receive_send_command(net_sock_t sock,
@@ -84,7 +84,11 @@ static int isr_validate_path(const char* path) {
 // Resolve a relative path against the server root. Returns 0 on success.
 static int isr_resolve_path(const char* root, const char* relative,
                              char* out, size_t out_size) {
+#ifdef _WIN32
+  int n = snprintf(out, out_size, "%s\\%s", root, relative);
+#else
   int n = snprintf(out, out_size, "%s/%s", root, relative);
+#endif
   if (n < 0 || (size_t)n >= out_size) return -1;
 
 #ifdef _WIN32
@@ -200,19 +204,22 @@ int isr_stat(const char* path, int* is_dir, uint64_t* size) {
 }
 
 int64_t isr_transmit_file_uncompressed(net_sock_t sock, int fd) {
-  uint8_t buffer[1024*64];
+  static uint8_t buffer[1024*64];
   int64_t checksum = 0;
   ssize_t bytes_read;
+
   while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
     checksum += _isr_count_byte_values(buffer, (uint32_t)bytes_read);
     if (net_send_exact(sock, buffer, (size_t)bytes_read) == -1)
       return -1;
   }
-  if (bytes_read == -1) return -1;
+
+  if (bytes_read < 0) return -1;
 
   uint64_t checksum_be = htobe64((uint64_t)checksum);
   if (net_send_exact(sock, &checksum_be, sizeof(checksum_be)) == -1)
     return -1;
+
   return checksum;
 }
 
@@ -425,7 +432,7 @@ int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
 
 int64_t isr_receive_file_uncompressed(net_sock_t sock, int fd,
                                        uint64_t effective_length) {
-  uint8_t buffer[1024 * 64];
+  static uint8_t buffer[1024 * 64];
   int64_t checksum = 0;
   uint64_t remaining = effective_length;
 

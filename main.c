@@ -1,9 +1,13 @@
 #define NET_IMPLEMENTATION
 #include "lib/mininet.h"
 #include "lib/isr.h"
+#include "lib/isr-cli.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 #define DEFAULT_PORT "42069"
 
@@ -11,13 +15,23 @@ static void usage(void) {
   fprintf(stderr,
     "Usage:\n"
     "  isr serve <directory> [-p port]\n"
-    "  isr send <host:port> <local_file> <remote_path> [-c blocksize] [-o]\n"
-    "  isr recv <host:port> <remote_path> [local_path] [-c blocksize]\n"
+    "  isr send <host:port> <local_path> <remote_path> [-c blocksize] [-o] [-r]\n"
+    "  isr recv <host:port> <remote_path> [local_dir] [-c blocksize] [-r]\n"
     "\n"
     "Options:\n"
     "  -p port       Port to listen on (default: " DEFAULT_PORT ")\n"
     "  -c blocksize  Enable LZ4 compression with given block size in KB\n"
     "  -o            Overwrite existing files\n"
+    "  -r            Recursive mode (upload/download entire directory trees)\n"
+    "\n"
+    "Send notes:\n"
+    "  - Without -r: sends a single file\n"
+    "  - With -r: uploads entire directory trees\n"
+    "\n"
+    "Recv notes:\n"
+    "  - local_dir: Directory to save files (defaults to current directory)\n"
+    "  - Without -r: directories show listings, files are downloaded\n"
+    "  - With -r: entire directory trees are downloaded\n"
   );
 }
 
@@ -76,6 +90,16 @@ static int cmd_serve(int argc, char* argv[]) {
       return 1;
     }
   }
+
+  // Strip trailing path separators (Windows _stat64 fails on paths like "..\")
+  char dir_buf[4096];
+  strncpy(dir_buf, directory, sizeof(dir_buf) - 1);
+  dir_buf[sizeof(dir_buf) - 1] = '\0';
+  size_t dlen = strlen(dir_buf);
+  while (dlen > 1 && (dir_buf[dlen-1] == '/' || dir_buf[dlen-1] == '\\')) {
+    dir_buf[--dlen] = '\0';
+  }
+  directory = dir_buf;
 
   // Validate directory
   int is_dir = 0;
@@ -154,15 +178,16 @@ static int cmd_serve(int argc, char* argv[]) {
 
 static int cmd_send(int argc, char* argv[]) {
   const char* hostport = NULL;
-  const char* local_file = NULL;
+  const char* local_path = NULL;
   const char* remote_path = NULL;
   uint32_t block_size = 0;
   uint8_t flags = 0;
+  int recursive = 0;
 
   // Parse args
   if (argc < 3) { usage(); return 1; }
   hostport = argv[0];
-  local_file = argv[1];
+  local_path = argv[1];
   remote_path = argv[2];
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -170,6 +195,8 @@ static int cmd_send(int argc, char* argv[]) {
       flags |= ISR_FLAG_USE_COMPRESSION;
     } else if (strcmp(argv[i], "-o") == 0) {
       flags |= ISR_FLAG_OVERWRITE;
+    } else if (strcmp(argv[i], "-r") == 0) {
+      recursive = 1;
     } else {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       usage();
@@ -184,86 +211,25 @@ static int cmd_send(int argc, char* argv[]) {
     return 1;
   }
 
-  // Open and stat local file
-  uint64_t file_size = 0;
-  if (isr_stat(local_file, NULL, &file_size) != 0) {
-    fprintf(stderr, "Error: cannot stat '%s'\n", local_file);
+  // Check if local_path is a directory
+  int is_dir = 0;
+  if (isr_stat(local_path, &is_dir, NULL) != 0) {
+    fprintf(stderr, "Error: '%s' does not exist\n", local_path);
     return 1;
   }
 
-  int fd = isr_open_read(local_file);
-  if (fd < 0) {
-    fprintf(stderr, "Error: cannot open '%s'\n", local_file);
-    return 1;
+  if (is_dir) {
+    if (!recursive) {
+      fprintf(stderr, "Error: '%s' is a directory (use -r for recursive send)\n",
+              local_path);
+      return 1;
+    }
+    return isr_cli_send_directory(host, port, remote_path, local_path,
+                                  flags, block_size);
   }
 
-  // Connect
-  net_sock_t sock = net_connect(host, port);
-  if (sock == NET_INVALID_SOCKET) {
-    fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
-    isr_close(fd);
-    return 1;
-  }
-
-  // Send command
-  if (isr_transmit_send_command(sock, remote_path, flags,
-                                 block_size, file_size) == -1) {
-    fprintf(stderr, "Failed to send command\n");
-    goto send_cleanup;
-  }
-
-  // Read server response
-  isr_response_t response;
-  if (net_recv_exact(sock, &response, sizeof(response)) == -1) {
-    fprintf(stderr, "Failed to read server response\n");
-    goto send_cleanup;
-  }
-
-  if (response.response_type == ISR_RESULT_OTHER_FAILURE) {
-    fprintf(stderr, "Server error: %s\n", response.response_data);
-    goto send_cleanup;
-  }
-
-  printf("Server accepted (%s). Sending %lu bytes...\n",
-         response.response_type == ISR_SEND_RESPONSE_CREATING ? "creating" : "overwriting",
-         (unsigned long)file_size);
-
-  // Stream file data
-  int64_t checksum;
-  if (flags & ISR_FLAG_USE_COMPRESSION) {
-    checksum = isr_transmit_file_compressed(sock, fd, block_size);
-  } else {
-    checksum = isr_transmit_file_uncompressed(sock, fd);
-  }
-
-  if (checksum == -1) {
-    fprintf(stderr, "Failed to transmit file data\n");
-    goto send_cleanup;
-  }
-
-  // Read final result
-  isr_response_t result;
-  if (net_recv_exact(sock, &result, sizeof(result)) == -1) {
-    fprintf(stderr, "Failed to read server result\n");
-    goto send_cleanup;
-  }
-
-  if (result.response_type == ISR_RESULT_OK) {
-    printf("Send successful.\n");
-  } else if (result.response_type == ISR_RESULT_CHECKSUM_BAD) {
-    fprintf(stderr, "Checksum mismatch!\n");
-  } else {
-    fprintf(stderr, "Server error: %s\n", result.response_data);
-  }
-
-  isr_close(fd);
-  net_close(sock);
-  return (result.response_type == ISR_RESULT_OK) ? 0 : 1;
-
-send_cleanup:
-  isr_close(fd);
-  net_close(sock);
-  return 1;
+  return isr_cli_send_file(host, port, remote_path, local_path,
+                            flags, block_size);
 }
 
 static int cmd_recv(int argc, char* argv[]) {
@@ -272,6 +238,7 @@ static int cmd_recv(int argc, char* argv[]) {
   const char* local_path = NULL;
   uint32_t block_size = 0;
   uint8_t flags = 0;
+  int recursive = 0;
 
   // Parse args
   if (argc < 2) { usage(); return 1; }
@@ -288,6 +255,8 @@ static int cmd_recv(int argc, char* argv[]) {
     if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
       block_size = (uint32_t)atoi(argv[++i]) * 1024;
       flags |= ISR_FLAG_USE_COMPRESSION;
+    } else if (strcmp(argv[i], "-r") == 0) {
+      recursive = 1;
     } else {
       fprintf(stderr, "Unknown option: %s\n", argv[i]);
       usage();
@@ -302,112 +271,15 @@ static int cmd_recv(int argc, char* argv[]) {
     return 1;
   }
 
-  // Connect
-  net_sock_t sock = net_connect(host, port);
-  if (sock == NET_INVALID_SOCKET) {
-    fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
-    return 1;
+  // Determine local directory (default to current directory)
+  const char* local_dir = local_path ? local_path : ".";
+
+  if (recursive) {
+    return isr_cli_download_directory(host, port, remote_path, local_dir,
+                                      flags, block_size);
   }
 
-  // Send recv command
-  if (isr_transmit_recv_command(sock, remote_path, flags, block_size) == -1) {
-    fprintf(stderr, "Failed to send receive command\n");
-    net_close(sock);
-    return 1;
-  }
-
-  // Read server confirmation
-  isr_recv_confirmation_t conf;
-  if (net_recv_exact(sock, &conf, sizeof(conf)) == -1) {
-    fprintf(stderr, "Failed to read server response\n");
-    net_close(sock);
-    return 1;
-  }
-
-  uint64_t effective_length = be64toh(conf.effective_length);
-
-  if (conf.response_type == ISR_RECV_TYPE_NOT_FOUND) {
-    fprintf(stderr, "Path not found on server.\n");
-    net_close(sock);
-    return 1;
-  }
-
-  if (conf.response_type == ISR_RESULT_OTHER_FAILURE) {
-    fprintf(stderr, "Server error.\n");
-    net_close(sock);
-    return 1;
-  }
-
-  if (conf.response_type == ISR_RECV_TYPE_DIRECTORY) {
-    // Directory listing
-    printf("Directory listing for '%s':\n", remote_path);
-
-    // Send go
-    uint8_t go = ISR_RECV_GO;
-    if (net_send(sock, &go, 1) == -1) {
-      fprintf(stderr, "Failed to send confirmation\n");
-      net_close(sock);
-      return 1;
-    }
-
-    int result = isr_receive_directory_listing(sock, effective_length);
-    net_close(sock);
-    return result == 0 ? 0 : 1;
-
-  } else if (conf.response_type == ISR_RECV_TYPE_FILE) {
-    // File data
-    printf("Receiving file (%lu bytes)...\n", (unsigned long)effective_length);
-
-    // Determine local path
-    const char* out_path = local_path;
-    if (!out_path) {
-      // Use basename of remote_path
-      const char* slash = strrchr(remote_path, '/');
-      out_path = slash ? slash + 1 : remote_path;
-    }
-
-    // Send go
-    uint8_t go = ISR_RECV_GO;
-    if (net_send(sock, &go, 1) == -1) {
-      fprintf(stderr, "Failed to send confirmation\n");
-      net_close(sock);
-      return 1;
-    }
-
-    int fd = isr_open_write(out_path);
-    if (fd < 0) {
-      fprintf(stderr, "Error: cannot open '%s' for writing\n", out_path);
-      net_close(sock);
-      return 1;
-    }
-
-    int64_t result;
-    if (flags & ISR_FLAG_USE_COMPRESSION) {
-      result = isr_receive_file_compressed(sock, fd, block_size,
-                                            effective_length);
-    } else {
-      result = isr_receive_file_uncompressed(sock, fd, effective_length);
-    }
-
-    isr_close(fd);
-    net_close(sock);
-
-    if (result == -1) {
-      fprintf(stderr, "Failed to receive file.\n");
-      return 1;
-    } else if (result == -2) {
-      fprintf(stderr, "Checksum mismatch!\n");
-      return 1;
-    }
-
-    printf("Received '%s' successfully.\n", out_path);
-    return 0;
-
-  } else {
-    fprintf(stderr, "Unexpected response type: 0x%02x\n", conf.response_type);
-    net_close(sock);
-    return 1;
-  }
+  return isr_cli_recv(host, port, remote_path, local_dir, flags, block_size);
 }
 
 int main(int argc, char* argv[]) {

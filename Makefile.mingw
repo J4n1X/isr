@@ -1,10 +1,10 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -O3 -std=c17 -D_GNU_SOURCE
+CC = x86_64-w64-mingw32-gcc-14-win32
+CFLAGS = -Wall -Wextra -O3 -std=c17
 INCLUDES = -Ilib
-LDFLAGS = 
+LDFLAGS = -lws2_32
 
-BUILD_DIR = build
-TARGET = $(BUILD_DIR)/isr
+BUILD_DIR = build-mingw
+TARGET = $(BUILD_DIR)/isr.exe
 
 # Explicitly defining sources based on your tree
 SRCS = main.c lib/isr.c lib/isr-cli.c lib/lz4.c
