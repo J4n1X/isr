@@ -99,6 +99,18 @@ typedef struct {
   uint8_t reserved: 6;
 } isr_direntry_t;
 
+// Populated by isr_receive_command() for server-side logging.
+typedef struct {
+  uint8_t cmd;           // ISR_COMMAND_SEND or ISR_COMMAND_RECV
+  char path[4096];       // Requested path
+  uint64_t file_size;    // SEND: bytes received; RECV file: file size; 0 for dir/mkdir
+  uint8_t is_dir;        // RECV: 1 if a directory listing was served
+  uint8_t is_compressed; // 1 if compression was negotiated
+  uint8_t is_overwrite;  // SEND: 1 if an existing file was overwritten
+  uint8_t is_mkdir;      // SEND: 1 if mkdir was the operation
+  uint8_t not_found;     // RECV: 1 if the requested path was not found
+} isr_request_info_t;
+
 // Used for the end checksum calculation
 static inline uint64_t _isr_count_byte_values(uint8_t* data, uint32_t length){
   uint64_t count = 0;
@@ -181,7 +193,8 @@ int64_t isr_receive_file_compressed(net_sock_t sock, int fd,
 int isr_receive_directory_listing(net_sock_t sock, uint64_t effective_length);
 
 // Delegates to the appropriate receive function based on the command type.
-int isr_receive_command(net_sock_t sock);
+// If info is non-NULL, it is populated with request details.
+int isr_receive_command(net_sock_t sock, isr_request_info_t* info);
 
 // Set the server root directory. Must be called before isr_receive_command().
 void isr_set_server_root(const char* root);

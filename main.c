@@ -39,6 +39,27 @@ static int parse_host_port(const char* input, char* host, size_t host_len,
   return 0;
 }
 
+static void get_peer_str(net_sock_t sock, char* buf, size_t len) {
+  struct sockaddr_storage ss;
+  socklen_t ss_len = sizeof(ss);
+  if (getpeername(sock, (struct sockaddr*)&ss, &ss_len) != 0) {
+    snprintf(buf, len, "unknown");
+    return;
+  }
+  char host[128], svc[16];
+  if (getnameinfo((struct sockaddr*)&ss, ss_len,
+                  host, sizeof(host), svc, sizeof(svc),
+                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+    snprintf(buf, len, "unknown");
+    return;
+  }
+  if (ss.ss_family == AF_INET6) {
+    snprintf(buf, len, "[%s]:%s", host, svc);
+  } else {
+    snprintf(buf, len, "%s:%s", host, svc);
+  }
+}
+
 static int cmd_serve(int argc, char* argv[]) {
   const char* directory = NULL;
   const char* port = DEFAULT_PORT;
@@ -94,13 +115,36 @@ static int cmd_serve(int argc, char* argv[]) {
       fprintf(stderr, "Failed to accept connection\n");
       continue;
     }
-    printf("Client connected.\n");
-    int result = isr_receive_command(client);
-    if (result == 0) {
-      printf("Request completed successfully.\n");
+
+    char peer[256];
+    get_peer_str(client, peer, sizeof(peer));
+
+    isr_request_info_t info = {0};
+    int result = isr_receive_command(client, &info);
+
+    if (info.path[0] == '\0') {
+      printf("[%s] connection error\n", peer);
+    } else if (info.cmd == ISR_COMMAND_SEND && info.is_mkdir) {
+      printf("[%s] MKDIR \"%s\" -> %s\n",
+             peer, info.path, result == 0 ? "OK" : "FAILED");
+    } else if (info.cmd == ISR_COMMAND_SEND) {
+      printf("[%s] SEND \"%s\" (%lu bytes)%s%s -> %s\n",
+             peer, info.path, (unsigned long)info.file_size,
+             info.is_overwrite ? " [overwrite]" : "",
+             info.is_compressed ? " [compressed]" : "",
+             result == 0 ? "OK" : "FAILED");
+    } else if (info.not_found) {
+      printf("[%s] RECV \"%s\" -> NOT FOUND\n", peer, info.path);
+    } else if (info.is_dir) {
+      printf("[%s] RECV \"%s\" [dir] -> %s\n",
+             peer, info.path, result == 0 ? "OK" : "FAILED");
     } else {
-      printf("Request failed.\n");
+      printf("[%s] RECV \"%s\" (%lu bytes)%s -> %s\n",
+             peer, info.path, (unsigned long)info.file_size,
+             info.is_compressed ? " [compressed]" : "",
+             result == 0 ? "OK" : "FAILED");
     }
+
     net_close(client);
   }
 

@@ -21,10 +21,12 @@
 // Forward declarations for internal command handlers
 static int isr_receive_send_command(net_sock_t sock,
                                      isr_send_command_header_t header,
-                                     const char* path);
+                                     const char* path,
+                                     isr_request_info_t* info);
 static int isr_receive_recv_command(net_sock_t sock,
                                      isr_recv_command_header_t header,
-                                     const char* path);
+                                     const char* path,
+                                     isr_request_info_t* info);
 static int isr_send_recv_confirmation(net_sock_t sock, uint8_t type,
                                        uint64_t length);
 
@@ -561,7 +563,7 @@ int isr_receive_directory_listing(net_sock_t sock, uint64_t effective_length) {
 // Phase 4: Server-side command handlers
 //
 
-int isr_receive_command(net_sock_t sock) {
+int isr_receive_command(net_sock_t sock, isr_request_info_t* info) {
   // Read command type byte
   uint8_t cmd;
   if (net_recv_exact(sock, &cmd, 1) == -1) return -1;
@@ -582,7 +584,18 @@ int isr_receive_command(net_sock_t sock) {
     if (net_recv_exact(sock, path, header.path_length) == -1) return -1;
     path[header.path_length] = '\0';
 
-    return isr_receive_send_command(sock, header, path);
+    if (info) {
+      info->cmd = ISR_COMMAND_SEND;
+      strncpy(info->path, path, sizeof(info->path) - 1);
+      info->path[sizeof(info->path) - 1] = '\0';
+      info->file_size = header.effective_length;
+      info->is_compressed = (header.flags & ISR_FLAG_USE_COMPRESSION) ? 1 : 0;
+      info->is_overwrite = 0; // updated in handler after checking if file exists
+      info->is_mkdir = (header.flags & ISR_FLAG_CREATE_DIRECTORY) ? 1 : 0;
+      info->is_dir = 0;
+    }
+
+    return isr_receive_send_command(sock, header, path, info);
 
   } else if (cmd == ISR_COMMAND_RECV) {
     // Read recv header
@@ -599,7 +612,18 @@ int isr_receive_command(net_sock_t sock) {
     if (net_recv_exact(sock, path, header.path_length) == -1) return -1;
     path[header.path_length] = '\0';
 
-    return isr_receive_recv_command(sock, header, path);
+    if (info) {
+      info->cmd = ISR_COMMAND_RECV;
+      strncpy(info->path, path, sizeof(info->path) - 1);
+      info->path[sizeof(info->path) - 1] = '\0';
+      info->is_compressed = (header.flags & ISR_FLAG_USE_COMPRESSION) ? 1 : 0;
+      info->is_overwrite = 0;
+      info->is_mkdir = 0;
+      info->file_size = 0; // updated in handler after stat
+      info->is_dir = 0;    // updated in handler after stat
+    }
+
+    return isr_receive_recv_command(sock, header, path, info);
 
   } else {
     fprintf(stderr, "Unknown command type: 0x%02x\n", cmd);
@@ -609,7 +633,8 @@ int isr_receive_command(net_sock_t sock) {
 
 static int isr_receive_send_command(net_sock_t sock,
                              isr_send_command_header_t header,
-                             const char* path) {
+                             const char* path,
+                             isr_request_info_t* info) {
   // Validate path
   if (isr_validate_path(path) == -1) {
     isr_transmit_send_response(sock, ISR_RESULT_OTHER_FAILURE,
@@ -641,6 +666,8 @@ static int isr_receive_send_command(net_sock_t sock,
   int is_dir = 0;
   uint64_t existing_size = 0;
   int exists = (isr_stat(full_path, &is_dir, &existing_size) == 0);
+
+  if (info) info->is_overwrite = exists ? 1 : 0;
 
   if (exists && is_dir) {
     isr_transmit_send_response(sock, ISR_RESULT_OTHER_FAILURE,
@@ -714,7 +741,8 @@ static int isr_send_recv_confirmation(net_sock_t sock, uint8_t type,
 
 static int isr_receive_recv_command(net_sock_t sock,
                              isr_recv_command_header_t header,
-                             const char* path) {
+                             const char* path,
+                             isr_request_info_t* info) {
   // Validate path
   if (isr_validate_path(path) == -1) {
     isr_send_recv_confirmation(sock, ISR_RESULT_OTHER_FAILURE, 0);
@@ -733,8 +761,14 @@ static int isr_receive_recv_command(net_sock_t sock,
   int is_dir = 0;
   uint64_t file_size = 0;
   if (isr_stat(full_path, &is_dir, &file_size) != 0) {
+    if (info) info->not_found = 1;
     isr_send_recv_confirmation(sock, ISR_RECV_TYPE_NOT_FOUND, 0);
     return 0;
+  }
+
+  if (info) {
+    info->is_dir = (uint8_t)is_dir;
+    info->file_size = is_dir ? 0 : file_size;
   }
 
   if (is_dir) {
