@@ -80,6 +80,14 @@ PACK_STRUCT_END
 #define ISR_COMMAND_SEND (uint8_t)0x01
 #define ISR_COMMAND_RECV (uint8_t)0x00
 
+// Send response types (isr_response_t.response_type)
+#define ISR_SEND_RESPONSE_CREATING (uint8_t)0x00
+#define ISR_SEND_RESPONSE_OVERWRITING (uint8_t)0x01
+
+// Recv confirmation types (isr_recv_confirmation_t.response_type)
+#define ISR_RECV_TYPE_FILE (uint8_t)0x00
+#define ISR_RECV_TYPE_DIRECTORY (uint8_t)0x01
+#define ISR_RECV_TYPE_NOT_FOUND (uint8_t)0x03
 
 // Directory listing helper struct
 typedef struct {
@@ -175,15 +183,18 @@ int isr_receive_directory_listing(net_sock_t sock, uint64_t effective_length);
 // Delegates to the appropriate receive function based on the command type.
 int isr_receive_command(net_sock_t sock);
 
-int isr_receive_send_command(net_sock_t sock, isr_send_command_header_t header,
-                             const char* path);
-
-int isr_receive_recv_command(net_sock_t sock, isr_recv_command_header_t header,
-                             const char* path);
-
 // Set the server root directory. Must be called before isr_receive_command().
 void isr_set_server_root(const char* root);
 
+//
+// Cross-platform utility functions
+//
+int net_recv_exact(net_sock_t sock, void* buf, size_t len);
+int net_send_exact(net_sock_t sock, const void* buf, size_t len);
+int isr_open_read(const char* path);
+int isr_open_write(const char* path);
+void isr_close(int fd);
+int isr_stat(const char* path, int* is_dir, uint64_t* size);
 
 
 #ifdef __cplusplus

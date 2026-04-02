@@ -18,6 +18,16 @@
 #include "isr.h"
 #include "lz4.h"
 
+// Forward declarations for internal command handlers
+static int isr_receive_send_command(net_sock_t sock,
+                                     isr_send_command_header_t header,
+                                     const char* path);
+static int isr_receive_recv_command(net_sock_t sock,
+                                     isr_recv_command_header_t header,
+                                     const char* path);
+static int isr_send_recv_confirmation(net_sock_t sock, uint8_t type,
+                                       uint64_t length);
+
 // Server root directory (set before accepting connections)
 static char isr_server_root_path[4096] = {0};
 
@@ -26,8 +36,7 @@ void isr_set_server_root(const char* root) {
   isr_server_root_path[sizeof(isr_server_root_path) - 1] = '\0';
 }
 
-// Read exactly len bytes from socket. Returns 0 on success, -1 on error/disconnect.
-static int net_recv_exact(net_sock_t sock, void* buf, size_t len) {
+int net_recv_exact(net_sock_t sock, void* buf, size_t len) {
   size_t total = 0;
   while (total < len) {
     int r = net_recv(sock, (char*)buf + total, len - total);
@@ -37,8 +46,7 @@ static int net_recv_exact(net_sock_t sock, void* buf, size_t len) {
   return 0;
 }
 
-// Send exactly len bytes. Returns 0 on success, -1 on error.
-static int net_send_exact(net_sock_t sock, const void* buf, size_t len) {
+int net_send_exact(net_sock_t sock, const void* buf, size_t len) {
   size_t total = 0;
   while (total < len) {
     int r = net_send(sock, (const char*)buf + total, len - total);
@@ -150,8 +158,7 @@ static int isr_mkdir_recursive(const char* path) {
 #endif
 }
 
-// Cross-platform file open for reading
-static int isr_open_read(const char* path) {
+int isr_open_read(const char* path) {
 #ifdef _WIN32
   return _open(path, _O_RDONLY | _O_BINARY);
 #else
@@ -159,8 +166,7 @@ static int isr_open_read(const char* path) {
 #endif
 }
 
-// Cross-platform file open for writing (create/truncate)
-static int isr_open_write(const char* path) {
+int isr_open_write(const char* path) {
 #ifdef _WIN32
   return _open(path, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
 #else
@@ -168,8 +174,7 @@ static int isr_open_write(const char* path) {
 #endif
 }
 
-// Cross-platform file close
-static void isr_close(int fd) {
+void isr_close(int fd) {
 #ifdef _WIN32
   _close(fd);
 #else
@@ -177,9 +182,7 @@ static void isr_close(int fd) {
 #endif
 }
 
-// Cross-platform file stat. Returns 0 on success.
-// Sets *is_dir to 1 if directory, 0 if file. Sets *size to file size.
-static int isr_stat(const char* path, int* is_dir, uint64_t* size) {
+int isr_stat(const char* path, int* is_dir, uint64_t* size) {
 #ifdef _WIN32
   struct _stat64 st;
   if (_stat64(path, &st) != 0) return -1;
@@ -194,30 +197,20 @@ static int isr_stat(const char* path, int* is_dir, uint64_t* size) {
   return 0;
 }
 
-int64_t isr_transmit_file_uncompressed(net_sock_t sock, int fd) { 
+int64_t isr_transmit_file_uncompressed(net_sock_t sock, int fd) {
   uint8_t buffer[1024*64];
   int64_t checksum = 0;
   ssize_t bytes_read;
   while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
     checksum += _isr_count_byte_values(buffer, (uint32_t)bytes_read);
-    ssize_t bytes_sent = 0;
-    while(bytes_sent < bytes_read) {
-      ssize_t result = net_send(sock, buffer + bytes_sent, bytes_read - bytes_sent);
-      if (result == -1) {
-        return -1; // Error occurred
-      }
-      bytes_sent += result;
-    }
+    if (net_send_exact(sock, buffer, (size_t)bytes_read) == -1)
+      return -1;
   }
-  if (bytes_read == -1) {
-    return -1; // Error occurred during read
-  }
-  // transmit the checksum as well
-  uint64_t checksum_network_order = htobe64((uint64_t)checksum);
-  if (net_send(sock, &checksum_network_order, 
-               sizeof(checksum_network_order)) == -1) {
-    return -1; // Error occurred during checksum send
-  }
+  if (bytes_read == -1) return -1;
+
+  uint64_t checksum_be = htobe64((uint64_t)checksum);
+  if (net_send_exact(sock, &checksum_be, sizeof(checksum_be)) == -1)
+    return -1;
   return checksum;
 }
 
@@ -226,12 +219,10 @@ int64_t isr_transmit_file_compressed(net_sock_t sock, int fd,
   int64_t checksum = 0;
   int max_compressed_size = LZ4_compressBound(uncompressed_block_size);
   uint8_t *buffer = malloc(uncompressed_block_size);
-  if (!buffer) return -1; // Allocation failed
+  if (!buffer) return -1;
   uint8_t *compressed_buffer = malloc(max_compressed_size);
-  if (!compressed_buffer) {
-    free(buffer);
-    return -1; // Allocation failed
-  }
+  if (!compressed_buffer) { free(buffer); return -1; }
+
   ssize_t bytes_read;
   while ((bytes_read = read(fd, buffer, uncompressed_block_size)) > 0) {
     checksum += _isr_count_byte_values(buffer, (uint32_t)bytes_read);
@@ -239,44 +230,26 @@ int64_t isr_transmit_file_compressed(net_sock_t sock, int fd,
                                                (char*)compressed_buffer,
                                                (int)bytes_read,
                                                max_compressed_size);
-    if (compressed_size <= 0) {
-      free(buffer);
-      free(compressed_buffer);
-      return -1; // Compression failed
-    }
+    if (compressed_size <= 0) goto fail;
 
-    // Send the compressed size first 
-    // (as a 4-byte integer in network byte order)
-    uint32_t compressed_size_network_order = htonl((uint32_t)compressed_size);
-    if (net_send(sock, &compressed_size_network_order, 
-                 sizeof(compressed_size_network_order)) == -1) {
-      free(buffer);
-      free(compressed_buffer);
-      return -1; // Error occurred during size send
-    }
-
-    ssize_t bytes_sent = 0;
-    while(bytes_sent < compressed_size) {
-      ssize_t result = net_send(sock, compressed_buffer + bytes_sent,
-                                compressed_size - bytes_sent);
-      if (result == -1) {
-        free(buffer);
-        free(compressed_buffer);
-        return -1; // Error occurred
-      }
-      bytes_sent += result;
-    }
+    uint32_t cs_be = htonl((uint32_t)compressed_size);
+    if (net_send_exact(sock, &cs_be, sizeof(cs_be)) == -1) goto fail;
+    if (net_send_exact(sock, compressed_buffer, (size_t)compressed_size) == -1)
+      goto fail;
   }
 
-  // Transmit the checksum
-  uint64_t checksum_network_order = htobe64((uint64_t)checksum);
-  if (net_send(sock, &checksum_network_order,
-               sizeof(checksum_network_order)) == -1) {
-    checksum = -1; // Error occurred during checksum send
-  }
+  uint64_t checksum_be = htobe64((uint64_t)checksum);
+  if (net_send_exact(sock, &checksum_be, sizeof(checksum_be)) == -1)
+    checksum = -1;
+
   free(buffer);
   free(compressed_buffer);
   return checksum;
+
+fail:
+  free(buffer);
+  free(compressed_buffer);
+  return -1;
 }
 
 int isr_transmit_send_command(net_sock_t sock, const char* path,
@@ -337,56 +310,56 @@ int isr_transmit_recv_command(net_sock_t sock, const char* path, uint8_t flags,
 }
 
 int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
-  // Directory listing wire format per entry:
-  //   uint8_t  type       (0 = file, 1 = directory)
-  //   uint64_t size       (big-endian)
-  //   uint16_t name_len   (big-endian)
-  //   char     name[name_len]
-  // Entire listing is followed by an 8-byte checksum.
+  // Single-pass: collect entries on the heap, compute total size,
+  // send confirmation header, then stream entries with checksum.
+
+  typedef struct { char name[256]; uint64_t size; uint8_t is_dir; } entry_t;
+  int count = 0, capacity = 256;
+  entry_t *entries = malloc(capacity * sizeof(entry_t));
+  if (!entries) return -1;
+  uint64_t total_size = 0;
 
 #ifdef _WIN32
   char search_path[4096];
   snprintf(search_path, sizeof(search_path), "%s\\*", path);
   WIN32_FIND_DATAA ffd;
   HANDLE hFind = FindFirstFileA(search_path, &ffd);
-  if (hFind == INVALID_HANDLE_VALUE) return -1;
-
-  // First pass: compute total size and collect entries
-  typedef struct { char name[260]; uint64_t size; uint8_t is_dir; } entry_t;
-  entry_t entries[4096];
-  int count = 0;
-  uint64_t total_size = 0;
+  if (hFind == INVALID_HANDLE_VALUE) { free(entries); return -1; }
 
   do {
     if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0)
       continue;
-    if (count >= 4096) break;
-    strncpy(entries[count].name, ffd.cFileName, 259);
-    entries[count].name[259] = '\0';
+    if (count >= capacity) {
+      capacity *= 2;
+      entry_t *tmp = realloc(entries, capacity * sizeof(entry_t));
+      if (!tmp) { free(entries); FindClose(hFind); return -1; }
+      entries = tmp;
+    }
+    strncpy(entries[count].name, ffd.cFileName, sizeof(entries[count].name) - 1);
+    entries[count].name[sizeof(entries[count].name) - 1] = '\0';
     entries[count].is_dir = (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
     entries[count].size = ((uint64_t)ffd.nFileSizeHigh << 32) | ffd.nFileSizeLow;
     uint16_t nlen = (uint16_t)strlen(entries[count].name);
-    total_size += 1 + 8 + 2 + nlen; // type + size + name_len + name
+    total_size += 1 + 8 + 2 + nlen;
     count++;
   } while (FindNextFileA(hFind, &ffd));
   FindClose(hFind);
 #else
   DIR* dir = opendir(path);
-  if (!dir) return -1;
-
-  typedef struct { char name[256]; uint64_t size; uint8_t is_dir; } entry_t;
-  entry_t entries[4096];
-  int count = 0;
-  uint64_t total_size = 0;
+  if (!dir) { free(entries); return -1; }
 
   struct dirent* de;
   while ((de = readdir(dir)) != NULL) {
     if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
       continue;
-    if (count >= 4096) break;
+    if (count >= capacity) {
+      capacity *= 2;
+      entry_t *tmp = realloc(entries, capacity * sizeof(entry_t));
+      if (!tmp) { free(entries); closedir(dir); return -1; }
+      entries = tmp;
+    }
     snprintf(entries[count].name, sizeof(entries[count].name), "%s", de->d_name);
 
-    // Stat the entry to get size and type
     char full_path[4096];
     snprintf(full_path, sizeof(full_path), "%s/%s", path, de->d_name);
     int is_dir = 0;
@@ -402,6 +375,17 @@ int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
   closedir(dir);
 #endif
 
+  // Send confirmation header
+  if (isr_send_recv_confirmation(sock, ISR_RECV_TYPE_DIRECTORY, total_size) == -1) {
+    free(entries);
+    return -1;
+  }
+
+  // Wait for client go/no-go
+  uint8_t go;
+  if (net_recv_exact(sock, &go, 1) == -1) { free(entries); return -1; }
+  if (go == ISR_RECV_UNABLE) { free(entries); return 0; }
+
   // Stream entries and compute checksum
   uint64_t checksum = 0;
   for (int i = 0; i < count; i++) {
@@ -410,20 +394,24 @@ int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
     uint16_t nlen = (uint16_t)strlen(entries[i].name);
     uint16_t nlen_be = htons(nlen);
 
-    checksum += _isr_count_byte_values(&type, 1);
-    if (net_send_exact(sock, &type, 1) == -1) return -1;
+    // Serialize entry into a small buffer for single checksum + send
+    uint8_t hdr[11]; // 1 + 8 + 2
+    hdr[0] = type;
+    memcpy(hdr + 1, &size_be, 8);
+    memcpy(hdr + 9, &nlen_be, 2);
 
-    checksum += _isr_count_byte_values((uint8_t*)&size_be, 8);
-    if (net_send_exact(sock, &size_be, 8) == -1) return -1;
-
-    checksum += _isr_count_byte_values((uint8_t*)&nlen_be, 2);
-    if (net_send_exact(sock, &nlen_be, 2) == -1) return -1;
-
+    checksum += _isr_count_byte_values(hdr, 11);
     checksum += _isr_count_byte_values((uint8_t*)entries[i].name, nlen);
-    if (net_send_exact(sock, entries[i].name, nlen) == -1) return -1;
+
+    if (net_send_exact(sock, hdr, 11) == -1) { free(entries); return -1; }
+    if (nlen > 0 && net_send_exact(sock, entries[i].name, nlen) == -1) {
+      free(entries);
+      return -1;
+    }
   }
 
-  // Send checksum
+  free(entries);
+
   uint64_t checksum_be = htobe64(checksum);
   if (net_send_exact(sock, &checksum_be, sizeof(checksum_be)) == -1) return -1;
   return 0;
@@ -478,29 +466,20 @@ int64_t isr_receive_file_compressed(net_sock_t sock, int fd,
 
   uint64_t remaining = effective_length;
   while (remaining > 0) {
-    // Read compressed block size
     uint32_t block_size_be;
-    if (net_recv_exact(sock, &block_size_be, sizeof(block_size_be)) == -1) {
-      free(compressed_buf); free(decompress_buf); return -1;
-    }
+    if (net_recv_exact(sock, &block_size_be, sizeof(block_size_be)) == -1)
+      goto fail;
     uint32_t block_size = ntohl(block_size_be);
 
-    // Read compressed block
-    if (net_recv_exact(sock, compressed_buf, block_size) == -1) {
-      free(compressed_buf); free(decompress_buf); return -1;
-    }
+    if (net_recv_exact(sock, compressed_buf, block_size) == -1) goto fail;
 
-    // Decompress
     int decompressed_size = LZ4_decompress_safe(
         (const char*)compressed_buf, (char*)decompress_buf,
         (int)block_size, (int)uncompressed_block_size);
-    if (decompressed_size <= 0) {
-      free(compressed_buf); free(decompress_buf); return -1;
-    }
+    if (decompressed_size <= 0) goto fail;
 
     checksum += _isr_count_byte_values(decompress_buf, (uint32_t)decompressed_size);
 
-    // Write to file
     size_t written = 0;
     while (written < (size_t)decompressed_size) {
 #ifdef _WIN32
@@ -510,7 +489,7 @@ int64_t isr_receive_file_compressed(net_sock_t sock, int fd,
       ssize_t w = write(fd, decompress_buf + written,
                         decompressed_size - written);
 #endif
-      if (w <= 0) { free(compressed_buf); free(decompress_buf); return -1; }
+      if (w <= 0) goto fail;
       written += (size_t)w;
     }
     remaining -= (uint64_t)decompressed_size;
@@ -526,6 +505,11 @@ int64_t isr_receive_file_compressed(net_sock_t sock, int fd,
   uint64_t wire_checksum = be64toh(wire_checksum_be);
   if (wire_checksum != (uint64_t)checksum) return -2;
   return checksum;
+
+fail:
+  free(compressed_buf);
+  free(decompress_buf);
+  return -1;
 }
 
 int isr_receive_directory_listing(net_sock_t sock, uint64_t effective_length) {
@@ -623,7 +607,7 @@ int isr_receive_command(net_sock_t sock) {
   }
 }
 
-int isr_receive_send_command(net_sock_t sock,
+static int isr_receive_send_command(net_sock_t sock,
                              isr_send_command_header_t header,
                              const char* path) {
   // Validate path
@@ -686,7 +670,7 @@ int isr_receive_send_command(net_sock_t sock,
   }
 
   // Send response: 0x00 for create, 0x01 for overwrite
-  uint8_t resp_type = exists ? 0x01 : 0x00;
+  uint8_t resp_type = exists ? ISR_SEND_RESPONSE_OVERWRITING : ISR_SEND_RESPONSE_CREATING;
   if (isr_transmit_send_response(sock, resp_type, NULL) == -1) return -1;
 
   // Open file for writing
@@ -720,15 +704,20 @@ int isr_receive_send_command(net_sock_t sock,
   }
 }
 
-int isr_receive_recv_command(net_sock_t sock,
+static int isr_send_recv_confirmation(net_sock_t sock, uint8_t type,
+                                       uint64_t length) {
+  isr_recv_confirmation_t conf = {0};
+  conf.response_type = type;
+  conf.effective_length = htobe64(length);
+  return net_send_exact(sock, &conf, sizeof(conf));
+}
+
+static int isr_receive_recv_command(net_sock_t sock,
                              isr_recv_command_header_t header,
                              const char* path) {
   // Validate path
   if (isr_validate_path(path) == -1) {
-    isr_recv_confirmation_t conf = {0};
-    conf.response_type = ISR_RESULT_OTHER_FAILURE;
-    conf.effective_length = 0;
-    net_send_exact(sock, &conf, sizeof(conf));
+    isr_send_recv_confirmation(sock, ISR_RESULT_OTHER_FAILURE, 0);
     return -1;
   }
 
@@ -736,10 +725,7 @@ int isr_receive_recv_command(net_sock_t sock,
   char full_path[4096];
   if (isr_resolve_path(isr_server_root_path, path,
                         full_path, sizeof(full_path)) == -1) {
-    isr_recv_confirmation_t conf = {0};
-    conf.response_type = ISR_RESULT_OTHER_FAILURE;
-    conf.effective_length = 0;
-    net_send_exact(sock, &conf, sizeof(conf));
+    isr_send_recv_confirmation(sock, ISR_RESULT_OTHER_FAILURE, 0);
     return -1;
   }
 
@@ -747,64 +733,18 @@ int isr_receive_recv_command(net_sock_t sock,
   int is_dir = 0;
   uint64_t file_size = 0;
   if (isr_stat(full_path, &is_dir, &file_size) != 0) {
-    // Path not found
-    isr_recv_confirmation_t conf = {0};
-    conf.response_type = 0x03;
-    conf.effective_length = 0;
-    net_send_exact(sock, &conf, sizeof(conf));
+    isr_send_recv_confirmation(sock, ISR_RECV_TYPE_NOT_FOUND, 0);
     return 0;
   }
 
   if (is_dir) {
-    // Compute directory listing size
-    uint64_t listing_size = 0;
-#ifdef _WIN32
-    char search_path[4096];
-    snprintf(search_path, sizeof(search_path), "%s\\*", full_path);
-    WIN32_FIND_DATAA ffd;
-    HANDLE hFind = FindFirstFileA(search_path, &ffd);
-    if (hFind != INVALID_HANDLE_VALUE) {
-      do {
-        if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0)
-          continue;
-        listing_size += 1 + 8 + 2 + (uint64_t)strlen(ffd.cFileName);
-      } while (FindNextFileA(hFind, &ffd));
-      FindClose(hFind);
-    }
-#else
-    DIR* dir = opendir(full_path);
-    if (dir) {
-      struct dirent* de;
-      while ((de = readdir(dir)) != NULL) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-          continue;
-        listing_size += 1 + 8 + 2 + (uint64_t)strlen(de->d_name);
-      }
-      closedir(dir);
-    }
-#endif
-
-    // Send confirmation header
-    isr_recv_confirmation_t conf = {0};
-    conf.response_type = 0x01; // directory listing
-    conf.effective_length = htobe64(listing_size);
-    if (net_send_exact(sock, &conf, sizeof(conf)) == -1) return -1;
-
-    // Wait for client go/no-go
-    uint8_t go;
-    if (net_recv_exact(sock, &go, 1) == -1) return -1;
-    if (go == ISR_RECV_UNABLE) return 0;
-
-    // Stream directory listing
+    // Collect directory listing, compute size, send confirmation, then stream
     return isr_transmit_recv_directory_listing(sock, full_path);
 
   } else {
     // File
-    // Send confirmation header
-    isr_recv_confirmation_t conf = {0};
-    conf.response_type = 0x00; // file data
-    conf.effective_length = htobe64(file_size);
-    if (net_send_exact(sock, &conf, sizeof(conf)) == -1) return -1;
+    if (isr_send_recv_confirmation(sock, ISR_RECV_TYPE_FILE, file_size) == -1)
+      return -1;
 
     // Wait for client go/no-go
     uint8_t go;

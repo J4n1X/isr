@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <limits.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,7 +42,7 @@ int net_init(void);
 /* Cleanup networking resources. */
 void net_cleanup(void);
 
-/* Connect to a remote host and port (IPv4/IPv6 agnositc). Returns socket or NET_INVALID_SOCKET. */
+/* Connect to a remote host and port (IPv4/IPv6 agnostic). Returns socket or NET_INVALID_SOCKET. */
 net_sock_t net_connect(const char* host, const char* port);
 
 /* Bind and listen on a local port. Returns listening socket or NET_INVALID_SOCKET. */
@@ -158,11 +159,13 @@ net_sock_t net_accept(net_sock_t server_sock) {
 }
 
 int net_send(net_sock_t sock, const void* data, size_t len) {
-    return send(sock, (const char*)data, (int)len, 0);
+    int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+    return send(sock, (const char*)data, chunk, 0);
 }
 
 int net_recv(net_sock_t sock, void* buf, size_t len) {
-    return recv(sock, (char*)buf, (int)len, 0);
+    int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+    return recv(sock, (char*)buf, chunk, 0);
 }
 
 void net_close(net_sock_t sock) {

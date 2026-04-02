@@ -5,20 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-  #include <io.h>
-  #include <fcntl.h>
-  #include <sys/stat.h>
-  #define ISR_STAT _stat64
-  #define ISR_STRUCT_STAT struct __stat64
-#else
-  #include <unistd.h>
-  #include <fcntl.h>
-  #include <sys/stat.h>
-  #define ISR_STAT stat
-  #define ISR_STRUCT_STAT struct stat
-#endif
-
 #define DEFAULT_PORT "42069"
 
 static void usage(void) {
@@ -53,17 +39,6 @@ static int parse_host_port(const char* input, char* host, size_t host_len,
   return 0;
 }
 
-// Helper to recv exactly n bytes (for client-side use in main.c)
-static int recv_exact(net_sock_t sock, void* buf, size_t len) {
-  size_t total = 0;
-  while (total < len) {
-    int r = net_recv(sock, (char*)buf + total, len - total);
-    if (r <= 0) return -1;
-    total += (size_t)r;
-  }
-  return 0;
-}
-
 static int cmd_serve(int argc, char* argv[]) {
   const char* directory = NULL;
   const char* port = DEFAULT_PORT;
@@ -82,16 +57,12 @@ static int cmd_serve(int argc, char* argv[]) {
   }
 
   // Validate directory
-  ISR_STRUCT_STAT st;
-  if (ISR_STAT(directory, &st) != 0) {
+  int is_dir = 0;
+  if (isr_stat(directory, &is_dir, NULL) != 0) {
     fprintf(stderr, "Error: '%s' does not exist\n", directory);
     return 1;
   }
-#ifdef _WIN32
-  if (!(st.st_mode & _S_IFDIR)) {
-#else
-  if (!S_ISDIR(st.st_mode)) {
-#endif
+  if (!is_dir) {
     fprintf(stderr, "Error: '%s' is not a directory\n", directory);
     return 1;
   }
@@ -170,18 +141,13 @@ static int cmd_send(int argc, char* argv[]) {
   }
 
   // Open and stat local file
-  ISR_STRUCT_STAT st;
-  if (ISR_STAT(local_file, &st) != 0) {
+  uint64_t file_size = 0;
+  if (isr_stat(local_file, NULL, &file_size) != 0) {
     fprintf(stderr, "Error: cannot stat '%s'\n", local_file);
     return 1;
   }
-  uint64_t file_size = (uint64_t)st.st_size;
 
-#ifdef _WIN32
-  int fd = _open(local_file, _O_RDONLY | _O_BINARY);
-#else
-  int fd = open(local_file, O_RDONLY);
-#endif
+  int fd = isr_open_read(local_file);
   if (fd < 0) {
     fprintf(stderr, "Error: cannot open '%s'\n", local_file);
     return 1;
@@ -191,11 +157,7 @@ static int cmd_send(int argc, char* argv[]) {
   net_sock_t sock = net_connect(host, port);
   if (sock == NET_INVALID_SOCKET) {
     fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
-#ifdef _WIN32
-    _close(fd);
-#else
-    close(fd);
-#endif
+    isr_close(fd);
     return 1;
   }
 
@@ -208,7 +170,7 @@ static int cmd_send(int argc, char* argv[]) {
 
   // Read server response
   isr_response_t response;
-  if (recv_exact(sock, &response, sizeof(response)) == -1) {
+  if (net_recv_exact(sock, &response, sizeof(response)) == -1) {
     fprintf(stderr, "Failed to read server response\n");
     goto send_cleanup;
   }
@@ -219,7 +181,7 @@ static int cmd_send(int argc, char* argv[]) {
   }
 
   printf("Server accepted (%s). Sending %lu bytes...\n",
-         response.response_type == 0x00 ? "creating" : "overwriting",
+         response.response_type == ISR_SEND_RESPONSE_CREATING ? "creating" : "overwriting",
          (unsigned long)file_size);
 
   // Stream file data
@@ -237,7 +199,7 @@ static int cmd_send(int argc, char* argv[]) {
 
   // Read final result
   isr_response_t result;
-  if (recv_exact(sock, &result, sizeof(result)) == -1) {
+  if (net_recv_exact(sock, &result, sizeof(result)) == -1) {
     fprintf(stderr, "Failed to read server result\n");
     goto send_cleanup;
   }
@@ -250,20 +212,12 @@ static int cmd_send(int argc, char* argv[]) {
     fprintf(stderr, "Server error: %s\n", result.response_data);
   }
 
-#ifdef _WIN32
-  _close(fd);
-#else
-  close(fd);
-#endif
+  isr_close(fd);
   net_close(sock);
   return (result.response_type == ISR_RESULT_OK) ? 0 : 1;
 
 send_cleanup:
-#ifdef _WIN32
-  _close(fd);
-#else
-  close(fd);
-#endif
+  isr_close(fd);
   net_close(sock);
   return 1;
 }
@@ -320,7 +274,7 @@ static int cmd_recv(int argc, char* argv[]) {
 
   // Read server confirmation
   isr_recv_confirmation_t conf;
-  if (recv_exact(sock, &conf, sizeof(conf)) == -1) {
+  if (net_recv_exact(sock, &conf, sizeof(conf)) == -1) {
     fprintf(stderr, "Failed to read server response\n");
     net_close(sock);
     return 1;
@@ -328,7 +282,7 @@ static int cmd_recv(int argc, char* argv[]) {
 
   uint64_t effective_length = be64toh(conf.effective_length);
 
-  if (conf.response_type == 0x03) {
+  if (conf.response_type == ISR_RECV_TYPE_NOT_FOUND) {
     fprintf(stderr, "Path not found on server.\n");
     net_close(sock);
     return 1;
@@ -340,7 +294,7 @@ static int cmd_recv(int argc, char* argv[]) {
     return 1;
   }
 
-  if (conf.response_type == 0x01) {
+  if (conf.response_type == ISR_RECV_TYPE_DIRECTORY) {
     // Directory listing
     printf("Directory listing for '%s':\n", remote_path);
 
@@ -356,7 +310,7 @@ static int cmd_recv(int argc, char* argv[]) {
     net_close(sock);
     return result == 0 ? 0 : 1;
 
-  } else if (conf.response_type == 0x00) {
+  } else if (conf.response_type == ISR_RECV_TYPE_FILE) {
     // File data
     printf("Receiving file (%lu bytes)...\n", (unsigned long)effective_length);
 
@@ -376,13 +330,7 @@ static int cmd_recv(int argc, char* argv[]) {
       return 1;
     }
 
-    // Open output file
-#ifdef _WIN32
-    int fd = _open(out_path, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
-                   _S_IREAD | _S_IWRITE);
-#else
-    int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-#endif
+    int fd = isr_open_write(out_path);
     if (fd < 0) {
       fprintf(stderr, "Error: cannot open '%s' for writing\n", out_path);
       net_close(sock);
@@ -397,11 +345,7 @@ static int cmd_recv(int argc, char* argv[]) {
       result = isr_receive_file_uncompressed(sock, fd, effective_length);
     }
 
-#ifdef _WIN32
-    _close(fd);
-#else
-    close(fd);
-#endif
+    isr_close(fd);
     net_close(sock);
 
     if (result == -1) {
