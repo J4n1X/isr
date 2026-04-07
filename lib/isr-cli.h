@@ -16,18 +16,18 @@ typedef struct {
 } isr_cli_dir_entry_t;
 
 // Send a file to a remote server.
-// Returns 0 on success, 1 on failure.
+// Returns 0 on success, -1 on failure.
 int isr_cli_send_file(const char* host, const char* port,
                       const char* remote_path, const char* local_file,
                       uint8_t flags, uint32_t block_size);
 
 // Create a directory on a remote server.
-// Returns 0 on success, 1 on failure.
+// Returns 0 on success, -1 on failure.
 int isr_cli_send_mkdir(const char* host, const char* port,
                        const char* remote_path);
 
 // Recursively send a local directory to a remote server.
-// Returns 0 on success, 1 on failure.
+// Returns 0 on success, -1 on failure.
 int isr_cli_send_directory(const char* host, const char* port,
                            const char* remote_path, const char* local_dir,
                            uint8_t flags, uint32_t block_size);
@@ -35,7 +35,7 @@ int isr_cli_send_directory(const char* host, const char* port,
 // Receive from a remote server (non-recursive).
 // If the remote path is a directory, prints a listing.
 // If it is a file, downloads it to local_dir.
-// Returns 0 on success, 1 on failure.
+// Returns 0 on success, -1 on failure.
 int isr_cli_recv(const char* host, const char* port,
                  const char* remote_path, const char* local_dir,
                  uint8_t flags, uint32_t block_size);
@@ -47,7 +47,7 @@ int isr_cli_download_file(const char* host, const char* port,
                           uint8_t flags, uint32_t block_size);
 
 // Recursively download a directory from a remote server.
-// Returns 0 on success, 1 on failure.
+// Returns 0 on success, -1 on failure.
 int isr_cli_download_directory(const char* host, const char* port,
                                const char* remote_path, const char* local_dir,
                                uint8_t flags, uint32_t block_size);

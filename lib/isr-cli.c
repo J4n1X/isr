@@ -60,60 +60,29 @@ static int receive_file_data(net_sock_t sock, int fd, uint8_t flags,
   return (result >= 0) ? 0 : (int)result;
 }
 
-// Create directories recursively (like mkdir -p).
-static void mkdir_p(const char* path) {
-  char buf[4096];
-  strncpy(buf, path, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
-
-  for (char* p = buf; *p; p++) {
-    if (*p == '/'
-#ifdef _WIN32
-        || *p == '\\'
-#endif
-    ) {
-      char saved = *p;
-      *p = '\0';
-      if (buf[0] != '\0') {
-#ifdef _WIN32
-        _mkdir(buf);
-#else
-        mkdir(buf, 0755);
-#endif
-      }
-      *p = saved;
-    }
-  }
-#ifdef _WIN32
-  _mkdir(buf);
-#else
-  mkdir(buf, 0755);
-#endif
-}
-
 int isr_cli_send_file(const char* host, const char* port,
                       const char* remote_path, const char* local_file,
                       uint8_t flags, uint32_t block_size) {
   uint64_t file_size = 0;
   if (isr_stat(local_file, NULL, &file_size) != 0) {
     fprintf(stderr, "Error: cannot stat '%s'\n", local_file);
-    return 1;
+    return -1;
   }
 
   int fd = isr_open_read(local_file);
   if (fd < 0) {
     fprintf(stderr, "Error: cannot open '%s'\n", local_file);
-    return 1;
+    return -1;
   }
 
   net_sock_t sock = net_connect(host, port);
   if (sock == NET_INVALID_SOCKET) {
     fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
     isr_close(fd);
-    return 1;
+    return -1;
   }
 
-  int ret = 1;
+  int ret = -1;
 
   if (isr_transmit_send_command(sock, remote_path, flags,
                                 block_size, file_size) == -1) {
@@ -175,21 +144,21 @@ int isr_cli_send_mkdir(const char* host, const char* port,
   net_sock_t sock = net_connect(host, port);
   if (sock == NET_INVALID_SOCKET) {
     fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
-    return 1;
+    return -1;
   }
 
   if (isr_transmit_send_command(sock, remote_path,
                                 ISR_FLAG_CREATE_DIRECTORY, 0, 0) == -1) {
     fprintf(stderr, "Failed to send mkdir command\n");
     net_close(sock);
-    return 1;
+    return -1;
   }
 
   isr_response_t response;
   if (net_recv_exact(sock, &response, sizeof(response)) == -1) {
     fprintf(stderr, "Failed to read server response\n");
     net_close(sock);
-    return 1;
+    return -1;
   }
 
   net_close(sock);
@@ -197,7 +166,7 @@ int isr_cli_send_mkdir(const char* host, const char* port,
   if (response.response_type != ISR_RESULT_OK) {
     fprintf(stderr, "Server error creating directory '%s': %s\n",
             remote_path, response.response_data);
-    return 1;
+    return -1;
   }
 
   return 0;
@@ -211,28 +180,28 @@ int isr_cli_send_directory(const char* host, const char* port,
   // Create the remote directory first
   if (isr_cli_send_mkdir(host, port, remote_path) != 0) {
     fprintf(stderr, "Failed to create remote directory: %s\n", remote_path);
-    return 1;
+    return -1;
   }
 
   int result = 0;
 
 #ifdef _WIN32
-  char pattern[4096];
+  char pattern[ISR_PATH_MAX];
   snprintf(pattern, sizeof(pattern), "%s\\*", local_dir);
 
   WIN32_FIND_DATAA fd;
   HANDLE hFind = FindFirstFileA(pattern, &fd);
   if (hFind == INVALID_HANDLE_VALUE) {
     fprintf(stderr, "Error: cannot open directory '%s'\n", local_dir);
-    return 1;
+    return -1;
   }
 
   do {
     if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
       continue;
 
-    char local_entry[4096];
-    char remote_entry[4096];
+    char local_entry[ISR_PATH_MAX];
+    char remote_entry[ISR_PATH_MAX];
     snprintf(local_entry, sizeof(local_entry), "%s/%s", local_dir, fd.cFileName);
     snprintf(remote_entry, sizeof(remote_entry), "%s/%s",
              remote_path, fd.cFileName);
@@ -241,14 +210,14 @@ int isr_cli_send_directory(const char* host, const char* port,
       if (isr_cli_send_directory(host, port, remote_entry, local_entry,
                                  flags, block_size) != 0) {
         fprintf(stderr, "Failed to upload directory: %s\n", local_entry);
-        result = 1;
+        result = -1;
       }
     } else {
       printf("  Uploading: %s -> %s\n", local_entry, remote_entry);
       if (isr_cli_send_file(host, port, remote_entry, local_entry,
                             flags, block_size) != 0) {
         fprintf(stderr, "Failed to upload file: %s\n", local_entry);
-        result = 1;
+        result = -1;
       }
     }
   } while (FindNextFileA(hFind, &fd));
@@ -258,7 +227,7 @@ int isr_cli_send_directory(const char* host, const char* port,
   DIR* dir = opendir(local_dir);
   if (!dir) {
     fprintf(stderr, "Error: cannot open directory '%s'\n", local_dir);
-    return 1;
+    return -1;
   }
 
   struct dirent* entry;
@@ -266,8 +235,8 @@ int isr_cli_send_directory(const char* host, const char* port,
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
 
-    char local_entry[4096];
-    char remote_entry[4096];
+    char local_entry[ISR_PATH_MAX];
+    char remote_entry[ISR_PATH_MAX];
     snprintf(local_entry, sizeof(local_entry), "%s/%s",
              local_dir, entry->d_name);
     snprintf(remote_entry, sizeof(remote_entry), "%s/%s",
@@ -276,7 +245,7 @@ int isr_cli_send_directory(const char* host, const char* port,
     int is_dir = 0;
     if (isr_stat(local_entry, &is_dir, NULL) != 0) {
       fprintf(stderr, "Error: cannot stat '%s'\n", local_entry);
-      result = 1;
+      result = -1;
       continue;
     }
 
@@ -284,14 +253,14 @@ int isr_cli_send_directory(const char* host, const char* port,
       if (isr_cli_send_directory(host, port, remote_entry, local_entry,
                                  flags, block_size) != 0) {
         fprintf(stderr, "Failed to upload directory: %s\n", local_entry);
-        result = 1;
+        result = -1;
       }
     } else {
       printf("  Uploading: %s -> %s\n", local_entry, remote_entry);
       if (isr_cli_send_file(host, port, remote_entry, local_entry,
                             flags, block_size) != 0) {
         fprintf(stderr, "Failed to upload file: %s\n", local_entry);
-        result = 1;
+        result = -1;
       }
     }
   }
@@ -311,47 +280,47 @@ int isr_cli_recv(const char* host, const char* port,
   isr_recv_confirmation_t conf;
   net_sock_t sock = recv_connect(host, port, remote_path, flags,
                                  block_size, &conf);
-  if (sock == NET_INVALID_SOCKET) return 1;
+  if (sock == NET_INVALID_SOCKET) return -1;
 
   uint64_t effective_length = be64toh(conf.effective_length);
 
   if (conf.response_type == ISR_RECV_TYPE_NOT_FOUND) {
     fprintf(stderr, "Path not found on server.\n");
     net_close(sock);
-    return 1;
+    return -1;
   }
 
   if (conf.response_type == ISR_RESULT_OTHER_FAILURE) {
     fprintf(stderr, "Server error.\n");
     net_close(sock);
-    return 1;
+    return -1;
   }
 
   if (conf.response_type == ISR_RECV_TYPE_DIRECTORY) {
     printf("Directory listing for '%s':\n", remote_path);
-    if (send_go(sock) == -1) { net_close(sock); return 1; }
+    if (send_go(sock) == -1) { net_close(sock); return -1; }
     int result = isr_receive_directory_listing(sock, effective_length);
     net_close(sock);
-    return result == 0 ? 0 : 1;
+    return result == 0 ? 0 : -1;
   }
 
   if (conf.response_type == ISR_RECV_TYPE_FILE) {
     printf("Receiving file (%lu bytes)...\n", (unsigned long)effective_length);
-    if (send_go(sock) == -1) { net_close(sock); return 1; }
+    if (send_go(sock) == -1) { net_close(sock); return -1; }
 
     const char* basename = strrchr(remote_path, '/');
     basename = basename ? basename + 1 : remote_path;
 
-    char out_path[4096];
+    char out_path[ISR_PATH_MAX];
     snprintf(out_path, sizeof(out_path), "%s/%s", local_dir, basename);
 
-    mkdir_p(local_dir);
+    isr_mkdir_recursive(local_dir);
 
     int fd = isr_open_write(out_path);
     if (fd < 0) {
       fprintf(stderr, "Error: cannot open '%s' for writing\n", out_path);
       net_close(sock);
-      return 1;
+      return -1;
     }
 
     int result = receive_file_data(sock, fd, flags, block_size,
@@ -361,10 +330,10 @@ int isr_cli_recv(const char* host, const char* port,
 
     if (result == -1) {
       fprintf(stderr, "Failed to receive file.\n");
-      return 1;
+      return -1;
     } else if (result == -2) {
       fprintf(stderr, "Checksum mismatch!\n");
-      return 1;
+      return -1;
     }
 
     printf("Received '%s' successfully.\n", out_path);
@@ -373,7 +342,7 @@ int isr_cli_recv(const char* host, const char* port,
 
   fprintf(stderr, "Unexpected response type: 0x%02x\n", conf.response_type);
   net_close(sock);
-  return 1;
+  return -1;
 }
 
 int isr_cli_download_file(const char* host, const char* port,
@@ -402,17 +371,9 @@ int isr_cli_download_file(const char* host, const char* port,
   if (send_go(sock) == -1) { net_close(sock); return -1; }
 
   // Create parent directories
-  char parent[4096];
-  strncpy(parent, local_path, sizeof(parent) - 1);
-  parent[sizeof(parent) - 1] = '\0';
-  char* last_sep = strrchr(parent, '/');
-#ifdef _WIN32
-  char* last_bs = strrchr(parent, '\\');
-  if (last_bs > last_sep) last_sep = last_bs;
-#endif
-  if (last_sep) {
-    *last_sep = '\0';
-    mkdir_p(parent);
+  char parent[ISR_PATH_MAX];
+  if (isr_parent_dir(local_path, parent, sizeof(parent)) == 0) {
+    isr_mkdir_recursive(parent);
   }
 
   int fd = isr_open_write(local_path);
@@ -514,6 +475,34 @@ void isr_cli_free_entries(isr_cli_dir_entry_t* entries, int count) {
   free(entries);
 }
 
+// Receive a directory listing buffer from the network and verify its checksum.
+// Returns the allocated buffer on success (caller must free), NULL on failure.
+// Sets *out_len to the buffer length on success.
+static uint8_t* recv_verified_listing(net_sock_t sock, uint64_t effective_length) {
+  uint8_t* buf = malloc((size_t)effective_length);
+  if (!buf) return NULL;
+
+  if (net_recv_exact(sock, buf, (size_t)effective_length) == -1) {
+    free(buf);
+    return NULL;
+  }
+
+  uint64_t checksum = _isr_count_byte_values(buf, (size_t)effective_length);
+  uint64_t wire_checksum_be;
+  if (net_recv_exact(sock, &wire_checksum_be, sizeof(wire_checksum_be)) == -1) {
+    free(buf);
+    return NULL;
+  }
+  uint64_t wire_checksum = be64toh(wire_checksum_be);
+  if (wire_checksum != checksum) {
+    fprintf(stderr, "Checksum mismatch for directory listing\n");
+    free(buf);
+    return NULL;
+  }
+
+  return buf;
+}
+
 int isr_cli_download_directory(const char* host, const char* port,
                                const char* remote_path, const char* local_dir,
                                uint8_t flags, uint32_t block_size) {
@@ -522,20 +511,20 @@ int isr_cli_download_directory(const char* host, const char* port,
   isr_recv_confirmation_t conf;
   net_sock_t sock = recv_connect(host, port, remote_path, flags,
                                  block_size, &conf);
-  if (sock == NET_INVALID_SOCKET) return 1;
+  if (sock == NET_INVALID_SOCKET) return -1;
 
   uint64_t effective_length = be64toh(conf.effective_length);
 
   if (conf.response_type == ISR_RECV_TYPE_NOT_FOUND) {
     fprintf(stderr, "Directory not found on server: %s\n", remote_path);
     net_close(sock);
-    return 1;
+    return -1;
   }
 
   if (conf.response_type == ISR_RESULT_OTHER_FAILURE) {
     fprintf(stderr, "Server error for path: %s\n", remote_path);
     net_close(sock);
-    return 1;
+    return -1;
   }
 
   if (conf.response_type == ISR_RECV_TYPE_FILE) {
@@ -545,53 +534,25 @@ int isr_cli_download_directory(const char* host, const char* port,
     const char* basename = strrchr(remote_path, '/');
     basename = basename ? basename + 1 : remote_path;
 
-    char local_file_path[4096];
+    char local_file_path[ISR_PATH_MAX];
     snprintf(local_file_path, sizeof(local_file_path), "%s/%s",
              local_dir, basename);
 
     return isr_cli_download_file(host, port, remote_path, local_file_path,
-                                 flags, block_size) == 0 ? 0 : 1;
+                                 flags, block_size);
   }
 
   if (conf.response_type != ISR_RECV_TYPE_DIRECTORY) {
     fprintf(stderr, "Unexpected response type: 0x%02x\n", conf.response_type);
     net_close(sock);
-    return 1;
+    return -1;
   }
 
-  if (send_go(sock) == -1) { net_close(sock); return 1; }
+  if (send_go(sock) == -1) { net_close(sock); return -1; }
 
-  // Read the entire listing into a buffer
-  uint8_t* buf = malloc((size_t)effective_length);
-  if (!buf) {
-    fprintf(stderr, "Failed to allocate memory for directory listing\n");
-    net_close(sock);
-    return 1;
-  }
-
-  if (net_recv_exact(sock, buf, (size_t)effective_length) == -1) {
-    free(buf);
-    net_close(sock);
-    return 1;
-  }
-
-  // Verify checksum
-  uint64_t checksum = _isr_count_byte_values(buf, (uint32_t)effective_length);
-  uint64_t wire_checksum_be;
-  if (net_recv_exact(sock, &wire_checksum_be, sizeof(wire_checksum_be)) == -1) {
-    free(buf);
-    net_close(sock);
-    return 1;
-  }
-  uint64_t wire_checksum = be64toh(wire_checksum_be);
-  if (wire_checksum != checksum) {
-    fprintf(stderr, "Checksum mismatch for directory listing\n");
-    free(buf);
-    net_close(sock);
-    return 1;
-  }
-
+  uint8_t* buf = recv_verified_listing(sock, effective_length);
   net_close(sock);
+  if (!buf) return -1;
 
   // Parse the directory listing
   int entry_count = 0;
@@ -601,17 +562,17 @@ int isr_cli_download_directory(const char* host, const char* port,
 
   if (!entries && entry_count != 0) {
     fprintf(stderr, "Failed to parse directory listing\n");
-    return 1;
+    return -1;
   }
 
-  mkdir_p(local_dir);
+  isr_mkdir_recursive(local_dir);
 
   int result = 0;
 
   // Process each entry
   for (int i = 0; i < entry_count; i++) {
-    char remote_entry_path[4096];
-    char local_entry_path[4096];
+    char remote_entry_path[ISR_PATH_MAX];
+    char local_entry_path[ISR_PATH_MAX];
 
     snprintf(remote_entry_path, sizeof(remote_entry_path), "%s/%s",
              remote_path, entries[i].name);
@@ -624,13 +585,13 @@ int isr_cli_download_directory(const char* host, const char* port,
                                      block_size) != 0) {
         fprintf(stderr, "Failed to download directory: %s\n",
                 remote_entry_path);
-        result = 1;
+        result = -1;
       }
     } else {
       if (isr_cli_download_file(host, port, remote_entry_path,
                                 local_entry_path, flags, block_size) != 0) {
         fprintf(stderr, "Failed to download file: %s\n", remote_entry_path);
-        result = 1;
+        result = -1;
       }
     }
   }

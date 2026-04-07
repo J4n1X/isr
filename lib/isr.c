@@ -31,7 +31,7 @@ static int isr_send_recv_confirmation(net_sock_t sock, uint8_t type,
                                        uint64_t length);
 
 // Server root directory (set before accepting connections)
-static char isr_server_root_path[4096] = {0};
+static char isr_server_root_path[ISR_PATH_MAX] = {0};
 
 void isr_set_server_root(const char* root) {
   strncpy(isr_server_root_path, root, sizeof(isr_server_root_path) - 1);
@@ -95,17 +95,17 @@ static int isr_resolve_path(const char* root, const char* relative,
   char resolved[MAX_PATH];
   if (!_fullpath(resolved, out, MAX_PATH)) return -1;
 #else
-  char resolved[4096];
+  char resolved[ISR_PATH_MAX];
   // realpath may fail if the file doesn't exist yet, so we resolve
   // the parent directory instead
-  char tmp[4096];
+  char tmp[ISR_PATH_MAX];
   strncpy(tmp, out, sizeof(tmp) - 1);
   tmp[sizeof(tmp) - 1] = '\0';
 
   // Find the last slash to get the parent directory
   char* last_slash = strrchr(tmp, '/');
   if (last_slash && last_slash != tmp) {
-    char basename_buf[4096];
+    char basename_buf[ISR_PATH_MAX];
     strncpy(basename_buf, last_slash + 1, sizeof(basename_buf) - 1);
     basename_buf[sizeof(basename_buf) - 1] = '\0';
     *last_slash = '\0';
@@ -140,9 +140,8 @@ static int isr_resolve_path(const char* root, const char* relative,
   return 0;
 }
 
-// Create directories recursively. Returns 0 on success.
-static int isr_mkdir_recursive(const char* path) {
-  char tmp[4096];
+int isr_mkdir_recursive(const char* path) {
+  char tmp[ISR_PATH_MAX];
   strncpy(tmp, path, sizeof(tmp) - 1);
   tmp[sizeof(tmp) - 1] = '\0';
 
@@ -162,6 +161,24 @@ static int isr_mkdir_recursive(const char* path) {
 #else
   return mkdir(tmp, 0755) == 0 || errno == EEXIST ? 0 : -1;
 #endif
+}
+
+int isr_parent_dir(const char* path, char* out, size_t out_size) {
+  size_t len = strlen(path);
+  if (len >= out_size) len = out_size - 1;
+  memcpy(out, path, len);
+  out[len] = '\0';
+  char* last_sep = strrchr(out, '/');
+#ifdef _WIN32
+  char* last_bsep = strrchr(out, '\\');
+  if (last_bsep && (!last_sep || last_bsep > last_sep))
+    last_sep = last_bsep;
+#endif
+  if (last_sep) {
+    *last_sep = '\0';
+    return 0;
+  }
+  return -1;
 }
 
 int isr_open_read(const char* path) {
@@ -188,6 +205,22 @@ void isr_close(int fd) {
 #endif
 }
 
+ssize_t isr_read(int fd, void* buf, size_t len) {
+#ifdef _WIN32
+  return _read(fd, buf, (unsigned)len);
+#else
+  return read(fd, buf, len);
+#endif
+}
+
+ssize_t isr_write(int fd, const void* buf, size_t len) {
+#ifdef _WIN32
+  return _write(fd, buf, (unsigned)len);
+#else
+  return write(fd, buf, len);
+#endif
+}
+
 int isr_stat(const char* path, int* is_dir, uint64_t* size) {
 #ifdef _WIN32
   struct _stat64 st;
@@ -203,13 +236,24 @@ int isr_stat(const char* path, int* is_dir, uint64_t* size) {
   return 0;
 }
 
+// Write all bytes to fd. Returns 0 on success, -1 on failure.
+static int isr_write_all(int fd, const uint8_t* buf, size_t len) {
+  size_t written = 0;
+  while (written < len) {
+    ssize_t w = isr_write(fd, buf + written, len - written);
+    if (w <= 0) return -1;
+    written += (size_t)w;
+  }
+  return 0;
+}
+
 int64_t isr_transmit_file_uncompressed(net_sock_t sock, int fd) {
-  static uint8_t buffer[1024*64];
+  uint8_t buffer[ISR_IO_BUFSIZE];
   int64_t checksum = 0;
   ssize_t bytes_read;
 
-  while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
-    checksum += _isr_count_byte_values(buffer, (uint32_t)bytes_read);
+  while ((bytes_read = isr_read(fd, buffer, sizeof(buffer))) > 0) {
+    checksum += _isr_count_byte_values(buffer, (size_t)bytes_read);
     if (net_send_exact(sock, buffer, (size_t)bytes_read) == -1)
       return -1;
   }
@@ -233,8 +277,8 @@ int64_t isr_transmit_file_compressed(net_sock_t sock, int fd,
   if (!compressed_buffer) { free(buffer); return -1; }
 
   ssize_t bytes_read;
-  while ((bytes_read = read(fd, buffer, uncompressed_block_size)) > 0) {
-    checksum += _isr_count_byte_values(buffer, (uint32_t)bytes_read);
+  while ((bytes_read = isr_read(fd, buffer, uncompressed_block_size)) > 0) {
+    checksum += _isr_count_byte_values(buffer, (size_t)bytes_read);
     int compressed_size = LZ4_compress_default((const char*)buffer,
                                                (char*)compressed_buffer,
                                                (int)bytes_read,
@@ -329,7 +373,7 @@ int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
   uint64_t total_size = 0;
 
 #ifdef _WIN32
-  char search_path[4096];
+  char search_path[ISR_PATH_MAX];
   snprintf(search_path, sizeof(search_path), "%s\\*", path);
   WIN32_FIND_DATAA ffd;
   HANDLE hFind = FindFirstFileA(search_path, &ffd);
@@ -369,7 +413,7 @@ int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
     }
     snprintf(entries[count].name, sizeof(entries[count].name), "%s", de->d_name);
 
-    char full_path[4096];
+    char full_path[ISR_PATH_MAX];
     snprintf(full_path, sizeof(full_path), "%s/%s", path, de->d_name);
     int is_dir = 0;
     uint64_t fsize = 0;
@@ -410,7 +454,7 @@ int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
     memcpy(hdr + 9, &nlen_be, 2);
 
     checksum += _isr_count_byte_values(hdr, 11);
-    checksum += _isr_count_byte_values((uint8_t*)entries[i].name, nlen);
+    checksum += _isr_count_byte_values((const uint8_t*)entries[i].name, nlen);
 
     if (net_send_exact(sock, hdr, 11) == -1) { free(entries); return -1; }
     if (nlen > 0 && net_send_exact(sock, entries[i].name, nlen) == -1) {
@@ -432,25 +476,15 @@ int isr_transmit_recv_directory_listing(net_sock_t sock, const char* path) {
 
 int64_t isr_receive_file_uncompressed(net_sock_t sock, int fd,
                                        uint64_t effective_length) {
-  static uint8_t buffer[1024 * 64];
+  uint8_t buffer[ISR_IO_BUFSIZE];
   int64_t checksum = 0;
   uint64_t remaining = effective_length;
 
   while (remaining > 0) {
     size_t to_read = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
     if (net_recv_exact(sock, buffer, to_read) == -1) return -1;
-    checksum += _isr_count_byte_values(buffer, (uint32_t)to_read);
-
-    size_t written = 0;
-    while (written < to_read) {
-#ifdef _WIN32
-      int w = _write(fd, buffer + written, (unsigned)(to_read - written));
-#else
-      ssize_t w = write(fd, buffer + written, to_read - written);
-#endif
-      if (w <= 0) return -1;
-      written += (size_t)w;
-    }
+    checksum += _isr_count_byte_values(buffer, to_read);
+    if (isr_write_all(fd, buffer, to_read) == -1) return -1;
     remaining -= to_read;
   }
 
@@ -487,20 +521,9 @@ int64_t isr_receive_file_compressed(net_sock_t sock, int fd,
         (int)block_size, (int)uncompressed_block_size);
     if (decompressed_size <= 0) goto fail;
 
-    checksum += _isr_count_byte_values(decompress_buf, (uint32_t)decompressed_size);
-
-    size_t written = 0;
-    while (written < (size_t)decompressed_size) {
-#ifdef _WIN32
-      int w = _write(fd, decompress_buf + written,
-                     (unsigned)(decompressed_size - written));
-#else
-      ssize_t w = write(fd, decompress_buf + written,
-                        decompressed_size - written);
-#endif
-      if (w <= 0) goto fail;
-      written += (size_t)w;
-    }
+    checksum += _isr_count_byte_values(decompress_buf, (size_t)decompressed_size);
+    if (isr_write_all(fd, decompress_buf, (size_t)decompressed_size) == -1)
+      goto fail;
     remaining -= (uint64_t)decompressed_size;
   }
 
@@ -530,7 +553,7 @@ int isr_receive_directory_listing(net_sock_t sock, uint64_t effective_length) {
   }
 
   // Verify checksum
-  uint64_t checksum = _isr_count_byte_values(buf, (uint32_t)effective_length);
+  uint64_t checksum = _isr_count_byte_values(buf, (size_t)effective_length);
   uint64_t wire_checksum_be;
   if (net_recv_exact(sock, &wire_checksum_be, sizeof(wire_checksum_be)) == -1) {
     free(buf); return -1;
@@ -549,7 +572,7 @@ int isr_receive_directory_listing(net_sock_t sock, uint64_t effective_length) {
     memcpy(&nlen, buf + offset, 2); nlen = ntohs(nlen); offset += 2;
     if (offset + nlen > effective_length) break;
 
-    char name[4096];
+    char name[ISR_PATH_MAX];
     size_t copy_len = nlen < sizeof(name) - 1 ? nlen : sizeof(name) - 1;
     memcpy(name, buf + offset, copy_len);
     name[copy_len] = '\0';
@@ -586,7 +609,7 @@ int isr_receive_command(net_sock_t sock, isr_request_info_t* info) {
     header.effective_length = be64toh(header.effective_length);
 
     // Read path
-    char path[4096];
+    char path[ISR_PATH_MAX];
     if (header.path_length >= sizeof(path)) return -1;
     if (net_recv_exact(sock, path, header.path_length) == -1) return -1;
     path[header.path_length] = '\0';
@@ -614,7 +637,7 @@ int isr_receive_command(net_sock_t sock, isr_request_info_t* info) {
     header.uncompressed_block_size = ntohl(header.uncompressed_block_size);
 
     // Read path
-    char path[4096];
+    char path[ISR_PATH_MAX];
     if (header.path_length >= sizeof(path)) return -1;
     if (net_recv_exact(sock, path, header.path_length) == -1) return -1;
     path[header.path_length] = '\0';
@@ -650,7 +673,7 @@ static int isr_receive_send_command(net_sock_t sock,
   }
 
   // Resolve full path
-  char full_path[4096];
+  char full_path[ISR_PATH_MAX];
   if (isr_resolve_path(isr_server_root_path, path,
                         full_path, sizeof(full_path)) == -1) {
     isr_transmit_send_response(sock, ISR_RESULT_OTHER_FAILURE,
@@ -689,17 +712,8 @@ static int isr_receive_send_command(net_sock_t sock,
   }
 
   // Create parent directories
-  char parent[4096];
-  strncpy(parent, full_path, sizeof(parent) - 1);
-  parent[sizeof(parent) - 1] = '\0';
-  char* last_slash = strrchr(parent, '/');
-#ifdef _WIN32
-  char* last_bslash = strrchr(parent, '\\');
-  if (last_bslash && (!last_slash || last_bslash > last_slash))
-    last_slash = last_bslash;
-#endif
-  if (last_slash) {
-    *last_slash = '\0';
+  char parent[ISR_PATH_MAX];
+  if (isr_parent_dir(full_path, parent, sizeof(parent)) == 0) {
     isr_mkdir_recursive(parent);
   }
 
@@ -757,7 +771,7 @@ static int isr_receive_recv_command(net_sock_t sock,
   }
 
   // Resolve full path
-  char full_path[4096];
+  char full_path[ISR_PATH_MAX];
   if (isr_resolve_path(isr_server_root_path, path,
                         full_path, sizeof(full_path)) == -1) {
     isr_send_recv_confirmation(sock, ISR_RESULT_OTHER_FAILURE, 0);

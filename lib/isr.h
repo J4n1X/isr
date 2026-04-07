@@ -10,6 +10,9 @@
 extern "C" {
 #endif
 
+#define ISR_PATH_MAX 4096
+#define ISR_IO_BUFSIZE (1024 * 64)
+
 // Command header sent by the client to initiate a file transfer.
 // It is followed by the path string (not null-terminated)
 PACK_STRUCT_BEGIN
@@ -89,16 +92,6 @@ PACK_STRUCT_END
 #define ISR_RECV_TYPE_DIRECTORY (uint8_t)0x01
 #define ISR_RECV_TYPE_NOT_FOUND (uint8_t)0x03
 
-// Directory listing helper struct
-typedef struct {
-  char *name;
-  uint64_t size;
-  uint8_t is_directory: 1;
-  // Unused for now.
-  uint8_t is_symlink: 1;
-  uint8_t reserved: 6;
-} isr_direntry_t;
-
 // Populated by isr_receive_command() for server-side logging.
 typedef struct {
   uint8_t cmd;           // ISR_COMMAND_SEND or ISR_COMMAND_RECV
@@ -112,9 +105,9 @@ typedef struct {
 } isr_request_info_t;
 
 // Used for the end checksum calculation
-static inline uint64_t _isr_count_byte_values(uint8_t* data, uint32_t length){
+static inline uint64_t _isr_count_byte_values(const uint8_t* data, size_t length){
   uint64_t count = 0;
-  for(uint32_t i = 0; i < length; i++){
+  for(size_t i = 0; i < length; i++){
     count += data[i];
   }
   return count;
@@ -207,7 +200,11 @@ int net_send_exact(net_sock_t sock, const void* buf, size_t len);
 int isr_open_read(const char* path);
 int isr_open_write(const char* path);
 void isr_close(int fd);
+ssize_t isr_read(int fd, void* buf, size_t len);
+ssize_t isr_write(int fd, const void* buf, size_t len);
 int isr_stat(const char* path, int* is_dir, uint64_t* size);
+int isr_mkdir_recursive(const char* path);
+int isr_parent_dir(const char* path, char* out, size_t out_size);
 
 
 #ifdef __cplusplus

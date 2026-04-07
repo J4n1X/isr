@@ -2,6 +2,7 @@
 #include "lib/mininet.h"
 #include "lib/isr.h"
 #include "lib/isr-cli.h"
+#include "lib/hostport.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,24 +36,6 @@ static void usage(void) {
   );
 }
 
-// Parse "host:port" into separate host and port strings.
-// Returns 0 on success, -1 on failure.
-static int parse_host_port(const char* input, char* host, size_t host_len,
-                            char* port, size_t port_len) {
-  const char* colon = strrchr(input, ':');
-  if (!colon || colon == input) return -1;
-
-  size_t hlen = (size_t)(colon - input);
-  if (hlen >= host_len) return -1;
-  memcpy(host, input, hlen);
-  host[hlen] = '\0';
-
-  const char* p = colon + 1;
-  if (strlen(p) == 0 || strlen(p) >= port_len) return -1;
-  strcpy(port, p);
-  return 0;
-}
-
 static void get_peer_str(net_sock_t sock, char* buf, size_t len) {
   struct sockaddr_storage ss;
   socklen_t ss_len = sizeof(ss);
@@ -74,6 +57,29 @@ static void get_peer_str(net_sock_t sock, char* buf, size_t len) {
   }
 }
 
+static void log_request(const char* peer, const isr_request_info_t* info,
+                        int result) {
+  const char* status = result == 0 ? "OK" : "FAILED";
+  if (info->path[0] == '\0') {
+    printf("[%s] connection error\n", peer);
+  } else if (info->cmd == ISR_COMMAND_SEND && info->is_mkdir) {
+    printf("[%s] MKDIR \"%s\" -> %s\n", peer, info->path, status);
+  } else if (info->cmd == ISR_COMMAND_SEND) {
+    printf("[%s] SEND \"%s\" (%lu bytes)%s%s -> %s\n",
+           peer, info->path, (unsigned long)info->file_size,
+           info->is_overwrite ? " [overwrite]" : "",
+           info->is_compressed ? " [compressed]" : "", status);
+  } else if (info->not_found) {
+    printf("[%s] RECV \"%s\" -> NOT FOUND\n", peer, info->path);
+  } else if (info->is_dir) {
+    printf("[%s] RECV \"%s\" [dir] -> %s\n", peer, info->path, status);
+  } else {
+    printf("[%s] RECV \"%s\" (%lu bytes)%s -> %s\n",
+           peer, info->path, (unsigned long)info->file_size,
+           info->is_compressed ? " [compressed]" : "", status);
+  }
+}
+
 static int cmd_serve(int argc, char* argv[]) {
   const char* directory = NULL;
   const char* port = DEFAULT_PORT;
@@ -92,7 +98,7 @@ static int cmd_serve(int argc, char* argv[]) {
   }
 
   // Strip trailing path separators (Windows _stat64 fails on paths like "..\")
-  char dir_buf[4096];
+  char dir_buf[ISR_PATH_MAX];
   strncpy(dir_buf, directory, sizeof(dir_buf) - 1);
   dir_buf[sizeof(dir_buf) - 1] = '\0';
   size_t dlen = strlen(dir_buf);
@@ -113,7 +119,7 @@ static int cmd_serve(int argc, char* argv[]) {
   }
 
   // Resolve to absolute path
-  char root[4096];
+  char root[ISR_PATH_MAX];
 #ifdef _WIN32
   if (!_fullpath(root, directory, sizeof(root))) {
 #else
@@ -145,29 +151,7 @@ static int cmd_serve(int argc, char* argv[]) {
 
     isr_request_info_t info = {0};
     int result = isr_receive_command(client, &info);
-
-    if (info.path[0] == '\0') {
-      printf("[%s] connection error\n", peer);
-    } else if (info.cmd == ISR_COMMAND_SEND && info.is_mkdir) {
-      printf("[%s] MKDIR \"%s\" -> %s\n",
-             peer, info.path, result == 0 ? "OK" : "FAILED");
-    } else if (info.cmd == ISR_COMMAND_SEND) {
-      printf("[%s] SEND \"%s\" (%lu bytes)%s%s -> %s\n",
-             peer, info.path, (unsigned long)info.file_size,
-             info.is_overwrite ? " [overwrite]" : "",
-             info.is_compressed ? " [compressed]" : "",
-             result == 0 ? "OK" : "FAILED");
-    } else if (info.not_found) {
-      printf("[%s] RECV \"%s\" -> NOT FOUND\n", peer, info.path);
-    } else if (info.is_dir) {
-      printf("[%s] RECV \"%s\" [dir] -> %s\n",
-             peer, info.path, result == 0 ? "OK" : "FAILED");
-    } else {
-      printf("[%s] RECV \"%s\" (%lu bytes)%s -> %s\n",
-             peer, info.path, (unsigned long)info.file_size,
-             info.is_compressed ? " [compressed]" : "",
-             result == 0 ? "OK" : "FAILED");
-    }
+    log_request(peer, &info, result);
 
     net_close(client);
   }
@@ -225,11 +209,11 @@ static int cmd_send(int argc, char* argv[]) {
       return 1;
     }
     return isr_cli_send_directory(host, port, remote_path, local_path,
-                                  flags, block_size);
+                                  flags, block_size) != 0 ? 1 : 0;
   }
 
   return isr_cli_send_file(host, port, remote_path, local_path,
-                            flags, block_size);
+                            flags, block_size) != 0 ? 1 : 0;
 }
 
 static int cmd_recv(int argc, char* argv[]) {
@@ -276,10 +260,10 @@ static int cmd_recv(int argc, char* argv[]) {
 
   if (recursive) {
     return isr_cli_download_directory(host, port, remote_path, local_dir,
-                                      flags, block_size);
+                                      flags, block_size) != 0 ? 1 : 0;
   }
 
-  return isr_cli_recv(host, port, remote_path, local_dir, flags, block_size);
+  return isr_cli_recv(host, port, remote_path, local_dir, flags, block_size) != 0 ? 1 : 0;
 }
 
 int main(int argc, char* argv[]) {
